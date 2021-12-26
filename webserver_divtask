@@ -1,0 +1,778 @@
+/*******************************
+ * webserver.c
+ *  version 5.0
+ *  Code for OS_CD_exp5 Business_Segmentation webserver
+ *   based on threadpool,Segment as read_msg,read_file,send_msg
+ *
+ *-Coded by David in CUP CS19 
+ *-2021.12.22 Wednesday
+ *
+ * -compile by:
+ * -gcc -std=gnu99 -g -o webserver webserver.c -lpthread
+ ******************************/
+#include <stdio.h>
+#include <time.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <pthread.h>
+#include <sys/stat.h>
+#include <sys/prctl.h>
+#define VERSION 23
+#define BUFSIZE 8096
+#define ERROR 42
+#define LOG 44
+#define FORBIDDEN 403
+#define NOTFOUND 404
+#define NUM_READMSG_THREAD 10
+#define NUM_READFILE_THREAD 10
+#define NUM_SENDMSG_THREAD 10
+#define POOLINIT 111
+#define ADDTASK 222
+#define THREAD_RUN 333
+#define TASKFLAG 444
+
+#ifndef SIGCLD
+# define SIGCLD SIGCHLD
+#endif
+
+struct{
+    char *ext;
+    char *filetype;
+}extensions[] = {
+    {"gif","image/gif"},{"jpg","image/jpg"},{"jepg","image/jepg"},
+    {"png","image/png"},{"ico","image/ico"},{"zip","image/zip"},
+    {"gz","image/gz"},{"tar","image/tar"},{"htm","text/html"},
+    {"html","text/html"},{0,0}
+};
+
+typedef struct {
+    int hit;
+    int fd;
+    int file_fd;
+    char buffer[BUFSIZE+1];
+    struct threadpool* readmsg_pool;
+    struct threadpool* readfile_pool;
+    struct threadpool* sendmsg_pool;
+} webparam;
+
+
+/* queue status and conditional variable*/
+typedef struct staconv
+{
+    pthread_mutex_t mutex;
+    pthread_cond_t cond; /*to block or awake thread in pool*/
+    int status;          /*taskqueue status：false 0 is no task,true 1 exist task*/
+}staconv;
+
+/*Task*/
+typedef struct task
+{
+    struct task* next;           /* next task */
+    void (*function)(void* arg); /* function pointer,decide effect of thread_do */
+    void* arg;                   /* function parameter pointer */
+}task;
+
+/*Task Queue*/
+typedef struct taskqueue
+{
+    pthread_mutex_t mutex; /* to read/read taskqueue in mutex status */
+    task *front;           /* point to taskqueue front */
+    task *rear;            /* point to taskqueue rear */  
+    staconv *has_jobs;     /* block thread ,according to status */
+    int len;               /* len(num of task)in task queue */
+}taskqueue;
+
+/* Thread */
+typedef struct thread
+{
+    int id;                 /* thread id */
+    pthread_t pthread;      /* POSIX thread  ,be packaged in this struct*/
+    struct threadpool* pool;/* band with threadpool ,m:1 */
+} thread;
+
+/*Thread Pool*/
+typedef struct threadpool
+{
+    thread** threads;                /* array of thread pointer */
+    volatile int num_threads;        /* num of thread in pool */
+    volatile int num_working;        /* num of working thread in pool */
+    pthread_mutex_t thcount_lock;    /* mutex to change the below 2 num*/
+    pthread_cond_t threads_all_idle; /* condition variable to destory thread */
+    taskqueue queue;                 /* taskqueue */
+    volatile int is_alive;           /* display the pool is alive or not */
+}threadpool;
+
+void logger(int type, char *s1, char *s2, int socket_fd);
+void * web_sendmsg(void * data);
+void * web_readfile(void * data);
+void * web_readmsg(void * data);
+void thread_record(FILE *threadfp,webparam *param,int hit);
+void init_time_statistics();
+
+struct threadpool* initThreadPool(int num_threads);
+void addTask2ThreadPool(threadpool* pool,task* curtask);
+void waitThreadPool(threadpool* pool);
+void destoryThreadPool(threadpool* pool);
+int getNumofThreadWorking(threadpool* pool);
+int getLenofTaskQueue(threadpool* pool);
+int create_thread(struct threadpool* pool, struct thread** pthread, int id);
+void* thread_do(struct thread* pthread);
+
+void init_taskqueue(taskqueue *tkq);  
+void push_taskqueue(taskqueue *tkq,task *curtask); 
+task* take_taskqueue(taskqueue *tkq);  
+void destory_taskqueue(taskqueue *tkq);
+
+void init_stacondv(staconv *has_jobs);
+void post_stacondv(staconv *has_jobs);
+void post_all_stacondv(staconv *has_jobs);
+void wait_stacondv(staconv *has_jobs);
+void destory_stacondv(staconv *has_jobs);
+
+struct timeval alvie_start,alive_end;
+pthread_mutex_t tlivet_mutex;
+double sum_thread_livet;
+int sum_thread_num;
+
+double total_readmsg = 0,total_readfile = 0,total_sendmsg = 0;
+int max_readmsg = 0,max_readfile = 0,max_sendmsg = 0;
+int max_rmq_len = 0,max_rfq_len = 0,max_smq_len = 0;
+
+
+/* initlize the status_condition_variable as 0 */
+void init_stacondv(staconv *has_jobs)
+{
+    pthread_mutex_init(&(has_jobs->mutex),NULL);
+    pthread_cond_init(&(has_jobs->cond),NULL);
+    has_jobs->status = 0;  /* set taskqueue without any task when init */
+}
+
+/* awake one thread */
+void post_stacondv(staconv *has_jobs)
+{
+    pthread_mutex_lock(&(has_jobs->mutex));
+        has_jobs->status = 1;
+        pthread_cond_signal(&(has_jobs->cond));
+    pthread_mutex_unlock(&(has_jobs->mutex));
+}
+
+/* awake all threads */
+void post_all_stacondv(staconv *has_jobs)
+{
+    pthread_mutex_lock(&(has_jobs->mutex));
+        has_jobs->status = 1;
+        pthread_cond_broadcast(&(has_jobs->cond));
+    pthread_mutex_unlock(&(has_jobs->mutex));
+}
+
+/* block all other threads */  
+void wait_stacondv(staconv *has_jobs)
+{
+    pthread_mutex_lock(&(has_jobs->mutex));
+        has_jobs->status = 0; 
+        while(has_jobs->status == 0){  //block when there is no task: 0 
+            /* actually release mutex ,go ahead when other thread break the 'while' condition,
+                then add mutex again,immediately */
+            pthread_cond_wait(&has_jobs->cond,&has_jobs->mutex);
+        }   
+    pthread_mutex_unlock(&(has_jobs->mutex));
+}
+
+/* destory its stacondv (when destory taskqueue)*/
+void destory_stacondv(staconv *has_jobs)
+{
+    pthread_mutex_destroy(&(has_jobs->mutex));
+    pthread_cond_destroy(&(has_jobs->cond));
+    free(has_jobs);
+} 
+
+void init_taskqueue(taskqueue *tkq)  
+{
+    pthread_mutex_init(&(tkq->mutex),NULL);
+    tkq->front = NULL;
+    tkq->rear = NULL;
+    tkq->len = 0;
+    tkq->has_jobs =  (struct staconv *)malloc(sizeof(struct staconv));
+    init_stacondv(tkq->has_jobs);
+}
+
+/* add new task to queue */
+void push_taskqueue(taskqueue *tkq,task *curtask)
+{
+    //logger(ADDTASK,"push this task into queue begin ","1",1);
+    pthread_mutex_lock(&tkq->mutex);
+    //logger(ADDTASK,"push this task into queue doing 0 ","1",1);
+    curtask->next = NULL;
+
+    //logger(ADDTASK,"push this task into queue doing 1 ","1",1);
+    if(tkq->len == 0){  //the first task
+        tkq->front = curtask;
+        tkq->rear = curtask;
+    }
+    else{  //there has been some task in taskqueue
+        tkq->rear->next = curtask;
+        tkq->rear = curtask;
+    }
+    //logger(ADDTASK,"push this task into queue doing 2 ","1",1);
+    tkq->len++;
+    post_stacondv(tkq->has_jobs);//awake a thread to deal this task
+
+    pthread_mutex_unlock(&tkq->mutex);
+    //logger(ADDTASK,"push this task into queue success ","1",1);
+}
+
+/* take(return) a task from head of taskqueue,and delete it */
+task* take_taskqueue(taskqueue *tkq)
+{
+    pthread_mutex_lock(&tkq->mutex);
+    task* headtask = tkq->front;//take the head one 
+    if(tkq->len == 0);  //queue is empty  ,0 task
+    else //1 or more than 1 task
+    {
+        tkq->front = tkq->front->next; 
+        tkq->len--;
+    }
+
+    pthread_mutex_unlock(&tkq->mutex);
+    return headtask;  
+}
+
+void destory_taskqueue(taskqueue *tkq)  //destory taskqueue 
+{
+    while(tkq->len != 0){
+        free(take_taskqueue(tkq));
+    }
+    tkq->front = NULL;
+    tkq->rear = NULL;
+    destory_stacondv(tkq->has_jobs);
+}
+
+/*initialization of ThreadPool*/
+struct threadpool* initThreadPool(int num_threads)
+{
+    //malloc space for threadpool
+    threadpool* pool;
+    pool=(threadpool*)malloc(sizeof(struct threadpool));
+    pool->num_threads=0;
+    pool->num_working=0;
+    pool->is_alive = 1;
+    
+    pthread_mutex_init(&(pool->thcount_lock), NULL);
+    pthread_cond_init(&(pool->threads_all_idle), NULL);
+
+    init_taskqueue(&pool->queue); 
+    
+    /* create array of thread */
+    pool->threads=(struct thread **)malloc(num_threads*sizeof(thread));
+    for (int i = 0; i < num_threads; ++i){
+        create_thread(pool,&(pool->threads[i]),i); //i for id,
+    }
+
+    /* Attention: here is busy waiting,wait for the thread operation,
+        then incease num_thread */
+    while(pool->num_threads!=num_threads);
+
+    return pool;
+}
+
+/* add task to Thread pool */
+void addTask2ThreadPool(threadpool* pool,task* curtask){
+    push_taskqueue(&pool->queue,curtask);
+    //logger(ADDTASK," addtask2threadpool conduct success","1",1);
+}
+
+/* wait for all task have been finished */
+void waitThreadPool(threadpool* pool)
+{
+    pthread_mutex_lock(&pool->thcount_lock);
+    while (pool->queue.len || pool->num_working) //when there are tasks in queue,or thread working
+    {
+        pthread_cond_wait(&pool->threads_all_idle, &pool->thcount_lock);
+    }
+    pthread_mutex_unlock(&pool->thcount_lock);
+}
+
+/* destory thread pool */
+void destoryThreadPool(threadpool* pool)
+{
+    /* this threadpool not exist */
+    if(pool == NULL)return;
+    
+    //beyond judgemnt packaged into waitThreadPool(pool)
+    waitThreadPool(pool);
+    pool->is_alive = 0;
+
+    post_all_stacondv(pool->queue.has_jobs);//first awake all threads
+    for (int i = 0; i < pool->num_threads; ++i){
+        pthread_join(pool->threads[i]->pthread,NULL); //i for id,
+    }
+    destory_taskqueue(&pool->queue); // destory taskqueue 
+    free(pool->threads);
+    
+    pthread_mutex_destroy(&pool->thcount_lock);
+    pthread_cond_destroy(&pool->threads_all_idle);
+
+    free(pool);
+}
+
+/* get num of thread which is working */
+int getNumofThreadWorking(threadpool* pool)
+{
+    return pool->num_working;
+}
+
+int getLenofTaskQueue(threadpool* pool){
+    return (pool->queue.len);
+}
+
+void init_time_statistics()
+{
+    pthread_mutex_init(&tlivet_mutex,NULL);
+    sum_thread_livet = 0;
+    sum_thread_num = NUM_READFILE_THREAD + NUM_READMSG_THREAD + NUM_SENDMSG_THREAD;
+}
+
+/* create a new thread,where actually run pthread_create*/
+int create_thread(struct threadpool* pool, struct thread** pthread, int id)
+{
+    //allocate memory space for thread
+    *pthread = (struct thread*)malloc(sizeof(struct thread));
+    if (pthread == NULL){
+        error("creat_thread(): Could not allocate memory for thread\n");
+        return -1;
+    }
+    
+    //set about this thread
+    (*pthread)->pool = pool;
+    (*pthread)->id = id;
+
+    //actually create thread using linux: pthread_create();
+    pthread_create(&(*pthread)->pthread, NULL, (void *)thread_do, (*pthread));
+    pthread_detach((*pthread)->pthread);
+    
+    //logger(POOLINIT,"enter create_thread()","num of tnreads \n",NUM_THREAD);
+    
+    return 0;
+}
+
+/* logic function of the thread actualy work */
+void* thread_do(struct thread* pthread)
+{
+    //logger(THREAD_RUN,"1","1",1);
+
+    char thread_name[128] = {0};
+    sprintf(thread_name, "thread-pool-%d", pthread->id);/* set the name of thread */
+    prctl(PR_SET_NAME, thread_name);
+    /* to get thread pool*/
+    threadpool* pool = pthread->pool;
+    /* actually create this thread when execute thread_do func, pool->num_threads++ */
+    
+    pthread_mutex_lock(&pool->thcount_lock);
+        (pool->num_threads)++; 
+    pthread_mutex_unlock(&pool->thcount_lock);
+    
+    //logger(THREAD_RUN,"1.2","1.2",1);
+    
+    /* thread work until : pool->is_alive == false 0 */
+    while(pool->is_alive){
+        /* if taskqueue not empty,then go ahead,else block
+        Attention: when taskqueue is empty ,break condition 1 of waitThreadPool(),
+        which has been set as "while (  (1)  pool->queue->len || (2)  pool->num_working  )" */
+        if(pool->queue.len == 0)
+        {
+            pthread_cond_signal(&pool->threads_all_idle);//break condition 1 of waitThreadPool() 
+            wait_stacondv(pool->queue.has_jobs);//empty ---> block
+            continue;
+        }
+        
+        if (pool->is_alive){
+            /* this thread is alive */
+            gettimeofday(&alvie_start,NULL);
+
+            /* run to here in this function,meaning this thread is working 
+            increase num of working_thread_num */
+            pthread_mutex_lock(&pool->thcount_lock);
+                (pool->num_working)++;
+            pthread_mutex_unlock(&pool->thcount_lock);
+            
+            /* take head from taskqueue and run,by use take_taskqueue */
+            void (*func)(void*);
+            void* arg;
+            
+            /* take_taskqueue :take the head from taskqueue, and delete this head from queue */
+            task* curtask = take_taskqueue(&pool->queue);
+
+                if (curtask != NULL) {
+                    func = curtask->function;
+                    arg = curtask->arg;
+                    func(arg);//run this task
+                    free(curtask);//free this task
+                }
+            /* run to here in this function,meaning thread has finished this task 
+            decrease num of working_thread_num */
+            pthread_mutex_lock(&pool->thcount_lock);
+                (pool->num_working)--;
+            pthread_mutex_unlock(&pool->thcount_lock);
+           
+           /* thread alive enter block */
+            gettimeofday(&alive_end,NULL);
+            pthread_mutex_lock(&tlivet_mutex);
+                sum_thread_livet += (double)(alive_end .tv_sec-alvie_start.tv_sec)*1000 + (double)(alive_end.tv_usec-alvie_start.tv_usec)/1000;     
+            pthread_mutex_unlock(&tlivet_mutex);
+            
+            /*Attention: when working_thread_num is 0, means all task have been finished,
+            then break the condition 2 of waitThreadPool() ,
+            which has been set as "while (  (1)  pool->queue->len || (2)  pool->num_working  )" */
+            if(getNumofThreadWorking(pool) == 0)
+            {
+                pthread_cond_signal(&pool->threads_all_idle);//break condition 1 of waitThreadPool() 
+            }
+        }
+    }
+
+    /* run to here ,meams thread is out,change the num of thread in pool */
+    pthread_mutex_lock(&pool->thcount_lock);
+        (pool->num_threads)--;
+    pthread_mutex_unlock(&pool->thcount_lock);
+    
+    return NULL;
+}
+
+
+/* A web thread divided into 3 part: 1.web_readmsg  2.web_readfile  3.web_sendmsg 
+   in original task run web() with 5 step:
+    1.read data from newwork   2.analysis data  3.read file  4.send data to network 5.logger(without exact order like above 4)
+    so the Part1 include 1.2.5 ,Part2 include 3.5 ,Part3 include 4.5 */
+void * web_readmsg(void * data)
+{
+    int fd;
+    int hit;
+    int j;
+    long i, ret;
+    char buffer[BUFSIZE+1]; /* static so zero filled */
+
+    webparam *param=(webparam*) data;
+    fd = param->fd;
+    hit = param->hit;
+
+    //1.read data from newwork--------------------------------------------------------------------------
+    ret =read(fd,buffer,BUFSIZE);    
+    if(ret == 0 || ret == -1)   
+        logger(FORBIDDEN,"failed to read browser request","",fd);   
+   
+    //2.analysis data--------------------------------------------------------------------------
+    if(ret > 0 && ret < BUFSIZE)  
+        buffer[ret]=0;    
+    else buffer[0]=0; 
+    
+    for(i=0;i<ret;i++)   /*  remove “CF” & “LF” from string*/ 
+        if(buffer[i] == '\r' || buffer[i] == '\n') 
+            buffer[i]='*'; 
+    logger(LOG,"Part1 request",buffer,hit); 
+    
+    if( strncmp(buffer,"GET ",4) && strncmp(buffer,"get ",4) ) 
+        logger(FORBIDDEN,"Only simple GET operation supported",buffer,fd); 
+   
+    for(i=4;i<BUFSIZE;i++) { /* null terminate after the second space to ignore extra stuff */ 
+        if(buffer[i] == ' ') { /* string is "GET URL " +lots of other stuff */ 
+            buffer[i] = 0; 
+        break; 
+        } 
+    } 
+    
+    for(j=0;j<i-1;j++)     
+        if(buffer[j] == '.' && buffer[j+1] == '.') { 
+            logger(FORBIDDEN,"Parent directory (..) path names not supported",buffer,fd); 
+    } 
+
+
+    logger(TASKFLAG,"## task 1:readmsg finish , begin to parpare for read file","1",1);
+    //finish the task part1 ,prepare for task part2
+    strcpy(param->buffer,buffer);
+    //logger(TASKFLAG,"task 1.5:parameter parpare string copy success","1",1);
+    struct task* filename_task = (struct task*)malloc(sizeof(task));
+    filename_task->function = (void*)web_readfile;
+    filename_task->arg = (void*)param;
+    filename_task->next = NULL;
+    //logger(TASKFLAG,"task 1.8:parameter parparation success","1",1);
+    addTask2ThreadPool(param->readfile_pool,filename_task);
+
+    //logger(ADDTASK,"Add 1:read msg finish,add task to readfile_pool","1",1);
+}
+
+void * web_readfile(void * data)
+{
+    int fd;
+    int hit;
+    int file_fd, buflen;
+    long i,len;
+    char * fstr;
+    char buffer[BUFSIZE+1]; /* static so zero filled */
+
+    webparam *param=(webparam*) data;
+    fd = param->fd;
+    hit = param->hit;
+    strcpy(buffer,param->buffer);
+    
+    //3.read file--------------------------------------------------------------------------
+    if( !strncmp(&buffer[0],"GET /\0",6) || !strncmp(&buffer[0],"get /\0",6) ) 
+    /* 如果请求消息中没有包含有效的文件名，则使用默认的文件名 index.html */ 
+    (void)strcpy(buffer,"GET /index.html"); 
+
+    /* 根据预定义在 extensions 中的文件类型，检查请求的文件类型是否本服务器支持  */ 
+    buflen=strlen(buffer); 
+    fstr = (char *)0; 
+    for(i=0;extensions[i].ext != 0;i++) { 
+        len = strlen(extensions[i].ext); 
+        if( !strncmp(&buffer[buflen-len], extensions[i].ext, len)) { 
+            fstr =extensions[i].filetype; 
+            break; 
+        } 
+    } 
+    if(fstr == 0) logger(FORBIDDEN,"file extension type not supported",buffer,fd); 
+ 
+    if(( file_fd = open(&buffer[5],O_RDONLY)) == -1) {   /*  打开指定的文件名*/ 
+        logger(NOTFOUND, "failed to open file",&buffer[5],fd); 
+    }     
+    logger(LOG,"Part2.1 SEND",&buffer[5],hit); 
+    len = (long)lseek(file_fd, (off_t)0, SEEK_END); /*  通过 lseek  获取文件长度*/ 
+    (void)lseek(file_fd, (off_t)0, SEEK_SET); /*  将文件指针移到文件首位置*/ 
+    (void)sprintf(buffer,"HTTP/1.1  200  OK\n Server:  nweb/%d.0\n Content-Length:  %ld\n Connection: close\n Content-Type: %s\n\n", VERSION, len, fstr); /* Header + a blank line */ 
+    logger(LOG,"Part2.2 Header",buffer,hit); 
+    (void)write(fd,buffer,strlen(buffer)); 
+
+    logger(TASKFLAG,"## task 2:readfile finish , begin to parpare for send msg","1",1);
+    //finish the task part 2 readfile ,prepare for task part 3 sendmsg
+    strcpy(param->buffer,buffer);
+    //logger(TASKFLAG,"task 2.5:parameter prepare string copy success","1",1);
+    param->file_fd = file_fd;
+    struct task* msg_task = (struct task*)malloc(sizeof(task));
+    msg_task->function = (void*)web_sendmsg;
+    msg_task->arg = (void*)param;
+    msg_task->next = NULL;
+    //logger(TASKFLAG,"task 2.8:parameter preare,msg_task is ready","1",1);
+    addTask2ThreadPool(param->sendmsg_pool,msg_task);
+    //logger(ADDTASK,"Add 2:read file finish,add task to sendmsg_pool","1",1);
+}
+
+void * web_sendmsg(void * data)
+{  
+    int fd;
+    int file_fd;
+    long ret;
+    char buffer[BUFSIZE+1]; 
+
+    webparam *param=(webparam*) data;
+    fd = param->fd;
+    file_fd = param->file_fd;
+    strcpy(buffer,param->buffer);
+
+    //4.send data to network--------------------------------------------------------------------------
+    /* send file in 8kb block - last block may be smaller */
+    while ((ret = read(file_fd, buffer, BUFSIZE)) > 0 ) { 
+        (void)write(fd,buffer,ret); 
+    } 
+
+    usleep(10000);/* before socket pipe close,left a period of time(0.01s) to send msg*/
+    close(file_fd);
+    logger(TASKFLAG,"## task 3:sendmsg finish ! ","1",1);
+    close(fd);
+    free(param);//free memeory
+}
+
+
+void logger(int type, char *s1, char *s2, int socket_fd)
+{
+    int fd ;
+    char logbuffer[BUFSIZE*2];
+
+    time_t timep;
+    struct tm *p;
+    time (&timep);
+    p=gmtime(&timep);
+
+    switch(type)
+    {
+        case ERROR:
+            (void)sprintf(logbuffer,"ERROR:%s:%s Errno=%d exiting pid=%d",s1,s2,errno,getpid());
+            break;
+        case FORBIDDEN:
+            (void)write(socket_fd, "HTTP/1.1 403 Forbidden\n Content-Length: 185\n Connection: close\n Content-Type: text/html\n\n<html><head>\n<title>403 Forbidden</title>\n</head><body>\n<h1>Forbidden</h1>\n The requested URL, file type or operation is not allowed on this simple static file webserver.\n</body></html>\n",271); 
+            (void)sprintf(logbuffer,"FORBIDDEN: %s:%s",s1, s2); 
+            break; 
+        case NOTFOUND: 
+            (void)write(socket_fd,  "HTTP/1.1  404  Not  Found\n Content-Length:  136\n Connection: close\n Content-Type:  text/html\n\n<html><head>\n<title>404  Not Found</title>\n</head><body>\n<h1>Not  Found</h1>\n The  requested  URL  was  not  found  on  this server.\n</body></html>\n",224); 
+            (void)sprintf(logbuffer,"NOT FOUND: %s:%s",s1, s2); 
+            break; 
+        case LOG: 
+            (void)sprintf(logbuffer,"INFO: %s:%s:%d\n",s1, s2,socket_fd); 
+            break; 
+        case POOLINIT:
+            (void)sprintf(logbuffer,"Current time:  %d:%d:%d\n INIT %s pool success,thread_num %d\n",(8+p->tm_hour)%24,p->tm_min,p->tm_sec,s1,socket_fd); 
+            break;
+        case ADDTASK:
+            (void)sprintf(logbuffer,"%s\n",s1); 
+            break;
+        case THREAD_RUN:
+            (void)sprintf(logbuffer,"This thread is working:Stage %s \n",s1); 
+            break;
+        case TASKFLAG:
+            (void)sprintf(logbuffer,"%s\n",s1); 
+            break;
+   } 
+    /* No checks here, nothing can be done with a failure anyway */
+    if((fd = open("divtask_web.log", O_CREAT| O_WRONLY | O_APPEND,0644)) >= 0) {
+    (void)write(fd,logbuffer,strlen(logbuffer));
+    (void)write(fd,"\n",1);
+    (void)close(fd);
+    }
+}
+
+void thread_record(FILE *threadfp,webparam *param,int hit)
+{
+    int now_readmsg,now_readfile,now_sendmsg;
+    int now_rmq_len,now_rfq_len,now_smq_len;
+    
+    now_rmq_len = getLenofTaskQueue(param->readmsg_pool);
+    now_rfq_len = getLenofTaskQueue(param->readfile_pool);
+    now_smq_len = getLenofTaskQueue(param->sendmsg_pool);
+    if(now_rmq_len > max_rmq_len)max_rmq_len = now_rmq_len;
+    if(now_rfq_len > max_rfq_len)max_rfq_len = now_rfq_len;
+    if(now_smq_len > max_smq_len)max_smq_len = now_smq_len;
+
+    now_readmsg  = getNumofThreadWorking(param->readmsg_pool);
+    now_readfile = getNumofThreadWorking(param->readfile_pool);
+    now_sendmsg  = getNumofThreadWorking(param->sendmsg_pool); 
+    if(now_readmsg > max_readmsg)max_readmsg = now_readmsg;
+    if(now_readfile>max_readfile)max_readfile= now_readfile;
+    if(now_sendmsg > max_sendmsg)max_sendmsg = now_sendmsg;
+
+    total_readmsg  += now_readmsg;
+    total_readfile += now_readfile;
+    total_sendmsg  += now_sendmsg;
+            
+    threadfp = fopen("taskdiv_infor_record.txt","a+");
+    fprintf(threadfp,"               readmsg|readfile|sendmsg\n");
+    fprintf(threadfp," now active thread num: %8d|%8d|%8d\n",now_readmsg,now_readfile,now_sendmsg);
+    fprintf(threadfp," max active thread num: %8d|%8d|%8d\n",max_readmsg,max_readfile,max_sendmsg);
+    fprintf(threadfp," mean active thread num:   %6.2f|%6.2f|%6.2f\n",total_readmsg/hit,total_readfile/hit,total_sendmsg/hit);
+    fprintf(threadfp," max taskqueue length:  %8d|%8d|%8d\n",max_rmq_len,max_rfq_len,max_smq_len);
+    fprintf(threadfp," thread alive mean time:%8f \n\n\n",sum_thread_livet/sum_thread_num);
+
+    fclose(threadfp);
+}
+
+int main(int argc, char **argv)
+{
+    int i, port, listenfd, socketfd, hit; 
+    socklen_t length; 
+    static struct sockaddr_in cli_addr; /* static = initialised to zeros */ 
+    static struct sockaddr_in serv_addr; /* static = initialised to zeros */ 
+    FILE *threadfp;
+    //struct timeval recordp;
+    //int timep;
+
+    //analysis commond parameter
+    if( argc < 3   || argc > 3 || !strcmp(argv[1], "-?") ) { 
+        (void)printf("hint: nweb Port-Number Top-Directory\t\tversion %d\n\n" 
+            "\tnweb is a small and very safe mini web server\n" 
+            "\tnweb only servers out file/web pages with extensions named below\n" 
+            "\t and only from the named directory or its sub-directories.\n" 
+            "\t There is no fancy features = safe and secure.\n\n" 
+            "\t Example:webserver 8181 /home/nwebdir &\n\n" 
+            "\t Only Supports:", VERSION); 
+
+        for(i=0;extensions[i].ext != 0;i++) 
+            (void)printf(" %s",extensions[i].ext); 
+ 
+        (void)printf("\n\t Not Supported: URLs including \"..\", Java, Javascript, CGI\n" 
+            "\t Not Supported: directories / /etc /bin /lib /tmp /usr /dev /sbin \n" 
+            "\t No warranty given or implied\n\t Nigel Griffiths nag@uk.ibm.com\n"   ); 
+        
+        exit(0); 
+   } 
+   if( !strncmp(argv[2],"/",2 ) || !strncmp(argv[2],"/etc", 5 ) || 
+       !strncmp(argv[2],"/bin",5 ) || !strncmp(argv[2],"/lib", 5 ) || 
+       !strncmp(argv[2],"/tmp",5 ) || !strncmp(argv[2],"/usr", 5 ) || 
+       !strncmp(argv[2],"/dev",5 ) || !strncmp(argv[2],"/sbin",6) ){ 
+        (void)printf("ERROR: Bad top directory %s, see nweb -?\n",argv[2]); 
+        exit(3); 
+   } 
+   if(chdir(argv[2]) == -1){ 
+        (void)printf("ERROR: Can't Change to directory %s\n",argv[2]); 
+        exit(4); 
+   } 
+   
+    /* Become deamon + unstopable and no zombies children (= no wait()) */
+    if(fork() != 0)
+        return 0; /* parent returns OK to shell */
+    (void)signal(SIGCLD, SIG_IGN); /* ignore child death */
+    (void)signal(SIGHUP, SIG_IGN); /* ignore terminal hangups */
+    for(i=0;i<32;i++)
+        (void)close(i); /* close open files */
+    (void)setpgrp(); /* break away from process group */
+    logger(LOG,"nweb starting",argv[1],getpid());
+
+    /* setup the network socket */
+    if((listenfd = socket(AF_INET, SOCK_STREAM,0)) <0)
+        logger(ERROR, "system call","socket",0);
+    port = atoi(argv[1]);
+    if(port < 0 || port >60000)
+        logger(ERROR,"Invalid port number (try 1->60000)",argv[1],0);
+
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    serv_addr.sin_port = htons(port);
+    if(bind(listenfd, (struct sockaddr *)&serv_addr,sizeof(serv_addr)) <0)
+        logger(ERROR,"system call","bind",0);
+    if( listen(listenfd,64) <0)
+        logger(ERROR,"system call","listen",0);
+      
+
+    struct threadpool *readmsg_threadpool = initThreadPool(NUM_READMSG_THREAD);
+    struct threadpool *readfile_threadpool = initThreadPool(NUM_READFILE_THREAD);
+    struct threadpool *sendmsg_threadpool = initThreadPool(NUM_SENDMSG_THREAD);
+
+    logger(POOLINIT,"readmsg_threadpool","1",NUM_READMSG_THREAD);
+    logger(POOLINIT,"readfile_threadpool","1",NUM_READFILE_THREAD);
+    logger(POOLINIT,"sendmsg_threadpool","1",NUM_SENDMSG_THREAD);
+
+    init_time_statistics();
+
+    for(hit=1; ;hit++) {
+        length = sizeof(cli_addr);
+
+        if((socketfd = accept(listenfd, (struct sockaddr *)&cli_addr, &length)) < 0)
+            logger(ERROR,"system call","accept",0);
+
+        else{
+            webparam *param=malloc(sizeof(webparam));
+            param->hit=hit;
+            param->fd=socketfd;
+            param->readmsg_pool = readmsg_threadpool;
+            param->readfile_pool = readfile_threadpool;
+            param->sendmsg_pool = sendmsg_threadpool;
+
+            struct task* netmsg_task = (struct task*)malloc(sizeof(task));
+            netmsg_task->function = (void*)web_readmsg; 
+            netmsg_task->arg = (void*)param;
+            netmsg_task->next = NULL;
+            
+            addTask2ThreadPool(param->readmsg_pool,netmsg_task);
+            thread_record(threadfp,param,hit);
+            
+            //logger(ADDTASK,"Add 0 start,add task to readmsg_pool","1",1);
+        } 
+    } 
+    destoryThreadPool(readmsg_threadpool);//maybe never conducted 
+    destoryThreadPool(readfile_threadpool);
+    destoryThreadPool(sendmsg_threadpool);
+}
